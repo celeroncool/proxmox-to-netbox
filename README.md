@@ -25,6 +25,20 @@ Install required packages:
 pip install -r requirements.txt
 ```
 
+### Credentials
+
+#### Proxmox
+Requires a API key with read permissions to /vms and /nodes paths.
+
+1. Create new account under Datacenter -> Permissions -> Users -> Add. 
+2. Select "Proxmox VE authentication" as realm
+3. Create new API token for user.
+4. Assign role "PVEAuditor" for API key and user/group under paths "/nodes" and "/vms" under Datacenter -> Permissions -> Add.
+
+#### Netbox
+Requires write permissions to create and update data.
+Create a new user, assign correct permissions and add new API key.
+
 ### Environment Configuration
 
 Create a `.env` file from the example:

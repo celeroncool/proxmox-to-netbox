@@ -4,8 +4,8 @@ import json
 import os
 import sys
 import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 load_dotenv()
 
@@ -45,6 +45,8 @@ def netbox_request(method, endpoint, data=None):
             response = requests.patch(url, headers=headers, json=data, verify=VERIFY_SSL)
         elif method == 'PUT':
             response = requests.put(url, headers=headers, json=data, verify=VERIFY_SSL)
+        elif method == 'DELETE':
+            response = requests.delete(url, headers=headers, verify=VERIFY_SSL)
 
         response.raise_for_status()
         return response.json() if response.content else None
@@ -87,6 +89,56 @@ def get_or_create_platform(platform_name):
     else:
         print(f"ERROR: Failed to create platform: {platform_name}")
         return None
+
+def check_existing_mac(mac_address):
+    """Check if MAC address already exists in NetBox"""
+    existing_macs = netbox_request('GET', f'dcim/mac-addresses/?mac_address={mac_address}')
+    if existing_macs and existing_macs['results']:
+        mac_info = existing_macs['results'][0]
+        print(f"INFO: MAC {mac_address} already exists (ID: {mac_info['id']})")
+        return mac_info
+    return None
+
+def create_or_update_mac_address(mac_address, interface_id):
+    """Create or update MAC address assignment in NetBox"""
+    if not mac_address:
+        return None
+
+    print(f"INFO: Processing MAC address: {mac_address}")
+
+    # Check if MAC already exists
+    existing_mac = check_existing_mac(mac_address)
+
+    if existing_mac:
+        # Update existing MAC address assignment
+        mac_payload = {
+            "mac_address": mac_address,
+            "assigned_object_type": "virtualization.vminterface",
+            "assigned_object_id": interface_id
+        }
+
+        result = netbox_request('PATCH', f'dcim/mac-addresses/{existing_mac["id"]}/', mac_payload)
+        if result:
+            print(f"INFO: Updated MAC address assignment: {mac_address}")
+            return result
+        else:
+            print(f"ERROR: Failed to update MAC address: {mac_address}")
+            return None
+    else:
+        # Create new MAC address
+        mac_payload = {
+            "mac_address": mac_address,
+            "assigned_object_type": "virtualization.vminterface",
+            "assigned_object_id": interface_id
+        }
+
+        result = netbox_request('POST', 'dcim/mac-addresses/', mac_payload)
+        if result:
+            print(f"INFO: Created MAC address: {mac_address}")
+            return result
+        else:
+            print(f"ERROR: Failed to create MAC address: {mac_address}")
+            return None
 
 def import_vm(vm_data):
     """Import a single VM into NetBox"""
@@ -190,34 +242,43 @@ def create_vm_disk(vm_id, disk_data):
 def create_vm_interface(vm_id, interface_data):
     """Create VM interface and IP addresses"""
     interface_name = interface_data['name']
+    mac_address = interface_data.get('mac', '')
 
-    # Create interface
+    print(f"INFO: Processing interface: {interface_name}")
+
+    # Create interface payload (without MAC address)
     interface_payload = {
         'virtual_machine': vm_id,
         'name': interface_name,
         'type': 'virtual'
     }
 
-    if 'mac' in interface_data and interface_data['mac'] and interface_data['mac'] != '00:00:00:00:00:00':
-        interface_payload['mac_address'] = interface_data['mac']
-
     # Check if interface exists
     existing_interfaces = netbox_request('GET', f'virtualization/interfaces/?virtual_machine_id={vm_id}&name={interface_name}')
     if existing_interfaces and existing_interfaces['results']:
         interface_id = existing_interfaces['results'][0]['id']
         interface = netbox_request('PATCH', f'virtualization/interfaces/{interface_id}/', interface_payload)
+        if interface:
+            print(f"INFO: Updated interface: {interface_name}")
+        else:
+            print(f"ERROR: Failed to update interface: {interface_name}")
+            return
     else:
         interface = netbox_request('POST', 'virtualization/interfaces/', interface_payload)
+        if interface:
+            print(f"INFO: Created interface: {interface_name}")
+            interface_id = interface['id']
+        else:
+            print(f"ERROR: Failed to create interface: {interface_name}")
+            return
 
-    if not interface:
-        print(f"ERROR: Failed to create interface: {interface_name}")
-        return
-
-    print(f"INFO: Created/updated interface: {interface_name}")
+    # Handle MAC address using the MAC address API
+    if mac_address:
+        create_or_update_mac_address(mac_address, interface_id)
 
     # Create IP addresses
     for ip_data in interface_data.get('ip_addresses', []):
-        create_ip_address(interface['id'], ip_data)
+        create_ip_address(interface_id, ip_data)
 
 def create_ip_address(interface_id, ip_data):
     """Create IP address for interface"""
