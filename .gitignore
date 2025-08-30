@@ -1,2 +1,6 @@
 proxmox_vms.json
 .env
+
+.venv
+.git
+venv
