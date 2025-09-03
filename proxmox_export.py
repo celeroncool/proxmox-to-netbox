@@ -44,11 +44,16 @@ all_vms = []
 def parse_disk_size(disk_str):
     if not disk_str:
         return 0
-    match = re.search(r"size=(\d+)([GM])", str(disk_str))
+    match = re.search(r"size=(\d+)([GMK])", str(disk_str))
     if not match:
         return 0
     size, unit = match.groups()
-    return int(size) if unit == "G" else int(size) * 1024
+    if unit == "G":
+      return int(size)
+    elif unit == "M":
+      return round(int(size) / 1024)
+    else:
+      return round(int(size) / 1024 / 1024)
 
 def extract_disk_info(config):
     """Extract individual disk information from QEMU VM config"""
