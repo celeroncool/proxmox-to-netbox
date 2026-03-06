@@ -140,6 +140,26 @@ def create_or_update_mac_address(mac_address, interface_id):
             print(f"ERROR: Failed to create MAC address: {mac_address}")
             return None
 
+def get_or_create_vlan(vid):
+    """Look up NetBox VLAN by VID, create it if not found."""
+    result = netbox_request('GET', f'ipam/vlans/?vid={vid}')
+    if result and result['results']:
+        vlan = result['results'][0]
+        print(f"INFO: Found VLAN {vid}: {vlan['name']} (ID: {vlan['id']})")
+        return vlan['id']
+
+    print(f"INFO: VLAN {vid} not found, creating...")
+    created = netbox_request('POST', 'ipam/vlans/', {
+        'vid': vid,
+        'name': f'VLAN-{vid}',
+    })
+    if created:
+        print(f"INFO: Created VLAN {vid} (ID: {created['id']})")
+        return created['id']
+
+    print(f"ERROR: Failed to create VLAN {vid}")
+    return None
+
 def import_vm(vm_data):
     """Import a single VM into NetBox"""
     vm_name = vm_data['name']
@@ -243,6 +263,7 @@ def create_vm_interface(vm_id, interface_data):
     """Create VM interface and IP addresses"""
     interface_name = interface_data['name']
     mac_address = interface_data.get('mac', '')
+    vlan_tag = interface_data.get('vlan_tag')
 
     print(f"INFO: Processing interface: {interface_name}")
 
@@ -250,8 +271,14 @@ def create_vm_interface(vm_id, interface_data):
     interface_payload = {
         'virtual_machine': vm_id,
         'name': interface_name,
-        'type': 'virtual'
+        'type': 'virtual',
     }
+
+    if vlan_tag is not None:
+        vlan_id = get_or_create_vlan(vlan_tag)
+        interface_payload['mode'] = 'access'
+        if vlan_id:
+            interface_payload['untagged_vlan'] = vlan_id
 
     # Check if interface exists
     existing_interfaces = netbox_request('GET', f'virtualization/interfaces/?virtual_machine_id={vm_id}&name={interface_name}')

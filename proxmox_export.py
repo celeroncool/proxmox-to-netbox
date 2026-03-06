@@ -80,78 +80,66 @@ def extract_lxc_disk_info(config):
     """Extract disk information from LXC container config"""
     disks = []
     if "rootfs" in config:
-        disk_size_gb = parse_disk_size(config["rootfs"])
-        disk_info = {
-            "name": "rootfs",
-            "size_gb": disk_size_gb,
+        disks.append({
+            "name":        "rootfs",
+            "size_gb":     parse_disk_size(config["rootfs"]),
             "description": str(config["rootfs"])
-        }
-        disks.append(disk_info)
-
-    # Check for additional mount points (mp0, mp1, etc.)
+        })
     for key, val in config.items():
         if re.match(r"^mp\d+$", key):
-            disk_size_gb = parse_disk_size(str(val))
-            disk_info = {
-                "name": key,
-                "size_gb": disk_size_gb,
+            disks.append({
+                "name":        key,
+                "size_gb":     parse_disk_size(str(val)),
                 "description": str(val)
-            }
-            disks.append(disk_info)
-
+            })
     return disks
 
 def extract_lxc_net(config):
     interfaces = []
     for key, val in config.items():
         if key.startswith("net"):
-            entry = {}
-            m_name = re.search(r"name=(\w+)", val)
-            m_mac = re.search(r"hwaddr=([0-9A-Fa-f:]+)", val)
-            m_ip4 = re.findall(r"ip=([\d\.]+/\d+)", val)
-            m_ip6 = re.findall(r"ip6=([0-9a-fA-F:]+/\d+)", val)
+            val = str(val)
+            m_name   = re.search(r"name=(\w+)", val)
+            m_mac    = re.search(r"hwaddr=([0-9A-Fa-f:]+)", val)
+            m_ip4    = re.findall(r"ip=([\d\.]+/\d+)", val)
+            m_ip6    = re.findall(r"ip6=([0-9a-fA-F:]+/\d+)", val)
+            m_tag    = re.search(r"tag=(\d+)", val)
 
-            if m_name:
-                entry["name"] = m_name.group(1)
-            if m_mac:
-                entry["mac"] = m_mac.group(1).lower()
-
-            entry["ip_addresses"] = []
-
-            # IPv4 addresses
+            ip_addresses = []
             for ip_cidr in m_ip4:
-                ip, prefix = ip_cidr.split('/')
-                if ip.startswith("127.") or ip.startswith("172."):
+                ip, prefix = ip_cidr.split("/")
+                if ip.startswith("127."):
                     continue
-                entry["ip_addresses"].append({"ip": ip, "prefix": int(prefix)})
-
-            # IPv6 addresses
+                ip_addresses.append({"ip": ip, "prefix": int(prefix)})
             for ip_cidr in m_ip6:
-                ip, prefix = ip_cidr.split('/')
-                if ip.lower().startswith("fe80::"):
-                    continue  # Skip link-local addresses
-                entry["ip_addresses"].append({"ip": ip, "prefix": int(prefix)})
+                ip, prefix = ip_cidr.split("/")
+                if ip.lower().startswith("fe80:"):
+                    continue
+                ip_addresses.append({"ip": ip, "prefix": int(prefix)})
 
-            interfaces.append(entry)
+            interfaces.append({
+                "name":        m_name.group(1) if m_name else key,
+                "mac":         m_mac.group(1).lower() if m_mac else None,
+                "vlan_tag":    int(m_tag.group(1)) if m_tag else None,
+                "ip_addresses": ip_addresses,
+            })
     return interfaces
 
 def get_qemu_net_interfaces(config):
     interfaces = []
     for key, val in config.items():
         if re.match(r"^net\d+$", key):
-            entry = {}
-            m_mac = re.search(r"([0-9A-Fa-f:]{17})", val)
+            val = str(val)
+            m_mac    = re.search(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", val)
             m_bridge = re.search(r"bridge=(\w+)", val)
+            m_tag    = re.search(r"tag=(\d+)", val)
 
-            if m_mac:
-                entry["mac"] = m_mac.group(1).lower()
-            if m_bridge:
-                entry["name"] = m_bridge.group(1)
-            else:
-                entry["name"] = f"net{len(interfaces)}"
-
-            entry["ip_addresses"] = []
-            interfaces.append(entry)
+            interfaces.append({
+                "name":         m_bridge.group(1) if m_bridge else key,
+                "mac":          m_mac.group(1).lower() if m_mac else None,
+                "vlan_tag":     int(m_tag.group(1)) if m_tag else None,
+                "ip_addresses": [],
+            })
     return interfaces
 
 def is_ipv6(ip):
@@ -161,6 +149,34 @@ def should_skip_interface(ifname):
     """Skip virtual/container interfaces that aren't relevant for NetBox"""
     skip_prefixes = ["br-", "lo", "Loopback", "veth", "docker", "tun", "tailscale"]
     return any(ifname.startswith(prefix) for prefix in skip_prefixes)
+
+def enrich_interfaces_with_agent(proxmox, node_name, vmid, interfaces):
+    try:
+        agent_data = proxmox.nodes(node_name).qemu(vmid).agent.get("network-get-interfaces")
+    except Exception as e:
+        print(f"WARN: Agent data not available for {vmid}: {e}")
+        return
+
+    mac_to_iface = {iface["mac"]: iface for iface in interfaces if iface.get("mac")}
+
+    for agent_iface in agent_data.get("result", []):
+        ifname = agent_iface.get("name", "")
+        if should_skip_interface(ifname):
+            continue
+
+        mac = agent_iface.get("hardware-address", "").lower()
+        iface = mac_to_iface.get(mac)
+        if iface is None:
+            continue
+
+        for ip in agent_iface.get("ip-addresses", []):
+            addr   = ip["ip-address"]
+            prefix = ip.get("prefix", 24 if ip["ip-address-type"] == "ipv4" else 64)
+            if addr.startswith("127."):
+                continue
+            if is_ipv6(addr) and addr.lower().startswith("fe80:"):
+                continue
+            iface["ip_addresses"].append({"ip": addr, "prefix": prefix})
 
 # Process all nodes
 for node in nodes:
@@ -194,7 +210,11 @@ for node in nodes:
                 continue
 
             try:
-                config = proxmox.nodes(node_name).qemu(vmid).config.get() if vtype == "qemu" else proxmox.nodes(node_name).lxc(vmid).config.get()
+                if vtype == "qemu":
+                    config = proxmox.nodes(node_name).qemu(vmid).config.get()
+                else:
+                    config = proxmox.nodes(node_name).lxc(vmid).config.get()
+
             except Exception as e:
                 print(f"ERROR: Failed to get config for {vmid}: {e}")
                 continue
@@ -202,63 +222,15 @@ for node in nodes:
             ostype = config.get("ostype", None)
             ostype = None if ostype and (ostype.startswith("win") or ostype == "l26") else ostype
 
-            # Extract disk information
-            disks = []
             if vtype == "qemu":
-                disks = extract_disk_info(config)
+                disks      = extract_disk_info(config)
+                interfaces = get_qemu_net_interfaces(config)
+                enrich_interfaces_with_agent(proxmox, node_name, vmid, interfaces)
             else:  # LXC
-                disks = extract_lxc_disk_info(config)
+                disks      = extract_lxc_disk_info(config)
+                interfaces = extract_lxc_net(config)
 
             print(f"INFO: Found {len(disks)} disks for VM {vmid}")
-
-            interfaces = []
-
-            # Try agent data for QEMU VMs only
-            if vtype == "qemu":
-                try:
-                    agent_data = proxmox.nodes(node_name).qemu(vmid).agent.get("network-get-interfaces")
-
-                    for iface in agent_data.get("result", []):
-                        ifname = iface.get("name")
-                        if should_skip_interface(ifname):
-                            continue
-
-                        mac = iface.get("hardware-address", "").lower()
-                        ip_list = []
-
-                        for ip in iface.get("ip-addresses", []):
-                            ip_addr = ip["ip-address"]
-                            prefix = ip.get("prefix", 24 if ip["ip-address-type"] == "ipv4" else 64)
-
-                            # Skip loopback addresses
-                            if ip_addr.startswith("127."):
-                                continue
-
-                            # Skip private docker networks
-                            if ip_addr.startswith("172."):
-                                continue
-
-                            # Skip IPv6 link-local addresses
-                            if is_ipv6(ip_addr) and ip_addr.lower().startswith("fe80::"):
-                                continue
-
-                            ip_list.append({
-                                "ip": ip_addr,
-                                "prefix": prefix
-                            })
-
-                        interfaces.append({
-                            "name": ifname,
-                            "mac": mac,
-                            "ip_addresses": ip_list
-                        })
-                except Exception as e:
-                    print(f"WARN: Agent data not available for {vmid}: {e}")
-                    # Fallback to config-based interface detection for QEMU
-                    interfaces = get_qemu_net_interfaces(config)
-            else:
-                # For LXC, always use config-based interface detection
-                interfaces = extract_lxc_net(config)
 
             vm_data = {
                 "name": vm["name"],
@@ -266,8 +238,8 @@ for node in nodes:
                 "status": "running",
                 "ostype": ostype,
                 "vcpu": config.get("cores", 1),
-                "ram_mb": int(config.get("memory", 0)),  # Ensure integer
-                "disks": disks,  # Individual disk information
+                "ram_mb": int(config.get("memory", 0)),
+                "disks": disks,
                 "interfaces": interfaces,
                 "host": node_name
             }
@@ -275,11 +247,11 @@ for node in nodes:
             all_vms.append(vm_data)
 
             # Count IPv4 and IPv6 addresses for summary
-            ipv4_count = sum(len([ip for ip in iface["ip_addresses"] if not is_ipv6(ip["ip"])]) for iface in interfaces)
-            ipv6_count = sum(len([ip for ip in iface["ip_addresses"] if is_ipv6(ip["ip"])]) for iface in interfaces)
-
-            total_disk_gb = sum(disk["size_gb"] for disk in disks)
-            print(f"INFO: Added {vm['name']} with {len(interfaces)} interfaces ({ipv4_count} IPv4, {ipv6_count} IPv6), {len(disks)} disks ({total_disk_gb}GB total)")
+            ipv4_count  = sum(1 for iface in interfaces for ip in iface["ip_addresses"] if not is_ipv6(ip["ip"]))
+            ipv6_count  = sum(1 for iface in interfaces for ip in iface["ip_addresses"] if is_ipv6(ip["ip"]))
+            total_disk  = sum(d["size_gb"] for d in disks)
+            print(f"INFO: Added {vm['name']} with {len(interfaces)} interfaces "
+                  f"({ipv4_count} IPv4, {ipv6_count} IPv6), {len(disks)} disks ({total_disk} GB total)")
 
     except Exception as e:
         print(f"ERROR: Failed to process node {node_name}: {e}")
